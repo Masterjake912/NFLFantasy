@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from draft_engine import DraftState
+from draft_engine import DraftState, canon_name
 
 state = DraftState()
 
@@ -88,6 +88,17 @@ body, .q-page, .nicegui-content {
 }
 .player-row:hover { border-color: #3b82f6; }
 .player-row.selected { border-color: #f5c518; background: #2a2410; }
+.player-row.ideal { border-color: #22c55e55; }
+.scarcity-bar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+.scar-card {
+  background: #121a2d; border: 1px solid #243056; border-radius: 12px; padding: 10px 12px;
+}
+.scar-card.warn { border-color: #f59e0b; }
+.scar-card.danger, .scar-card.gone { border-color: #ef4444; }
+.scar-kicker { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: #9db0d8; font-weight: 700; }
+.scar-count { font-size: 26px; font-weight: 800; line-height: 1.1; }
+.scar-best { font-size: 13px; font-weight: 700; margin-top: 4px; cursor: pointer; }
+.scar-best:hover { color: #f5c518; }
 """
 
 
@@ -143,21 +154,30 @@ def render_player_rows() -> None:
     if not players:
         ui.label("No players match that search.").classes("muted")
         return
+    ranks = state.ideal_rank_lookup(state.current_round) if state.is_user_pick else {}
     for p in players:
         selected = " selected" if p.name == state.selected_name else ""
-        with ui.row().classes(f"player-row w-full items-center justify-between{selected}"):
+        on_board = " ideal" if canon_name(p.name) in ranks else ""
+        with ui.row().classes(f"player-row w-full items-center justify-between{selected}{on_board}"):
             with ui.row().classes("items-center gap-2").on("click", lambda n=p.name: select_row(n)):
                 ui.badge(p.position).style(f"background:{POS_COLORS.get(p.position, '#64748b')}")
                 with ui.column().classes("gap-0"):
                     ui.label(p.name).classes("font-bold")
-                    ui.label(f"{p.team} · bye {p.bye or '—'} · ADP {p.adp:.1f}").classes("muted")
-            ui.button("Draft", on_click=lambda n=p.name: draft_named(n)).props(
-                "dense unelevated color=amber-8 text-color=black"
-            )
+                    vorp = f"{p.vorp:.1f}" if p.vorp is not None else f"{p.value_score:.1f}"
+                    ui.label(
+                        f"{p.team} · bye {p.bye or '—'} · ADP {p.adp:.1f} · VORP {vorp}"
+                    ).classes("muted")
+            with ui.row().classes("items-center gap-1"):
+                if canon_name(p.name) in ranks:
+                    ui.badge("BOARD").style("background:#22c55e")
+                ui.button("Draft", on_click=lambda n=p.name: draft_named(n)).props(
+                    "dense unelevated color=amber-8 text-color=black"
+                )
 
 
 def refresh_all() -> None:
     clock_panel.refresh()
+    scarcity_panel.refresh()
     board_panel.refresh()
     refresh_pool_rows()
     advice_panel.refresh()
@@ -208,6 +228,25 @@ def clock_panel() -> None:
 
 
 @ui.refreshable
+def scarcity_panel() -> None:
+    ui.label("Starters left on the board").classes("clock-kicker q-mt-sm")
+    with ui.element("div").classes("scarcity-bar"):
+        for row in state.skill_snapshot():
+            with ui.element("div").classes(f"scar-card {row['urgency']}"):
+                ui.label(row["tier"]).classes("scar-kicker")
+                ui.label(f"{row['left']}  /  {row['total']}").classes("scar-count")
+                if row["best"] is not None:
+                    best = row["best"]
+                    label = f"Best left: {best.name}"
+                    ui.label(label).classes("scar-best").on("click", lambda n=best.name: draft_named(n))
+                    ui.label(f"{best.team} · ADP {best.adp:.1f}").classes("muted")
+                else:
+                    ui.label("Board is empty here").classes("muted")
+                if row["note"]:
+                    ui.label(row["note"]).classes("muted")
+
+
+@ui.refreshable
 def board_panel() -> None:
     with ui.element("div").classes("board-wrap"):
         ui.html(board_markup(), sanitize=False)
@@ -250,17 +289,64 @@ def advice_panel() -> None:
 
         if state.is_user_pick:
             ui.label("Your pick advice").classes("text-subtitle1 font-bold")
-            ui.label("From fantasy_draft_optimizer.py, using your current roster.").classes("muted")
+            ui.label(
+                "Rankings mix your round board, starter balance (2 RB / 2 WR / 1 TE / 1 QB), and VORP."
+            ).classes("muted")
+            for note in state.scarcity_notes():
+                ui.label(f"• {note}").classes("note")
             for note in state.strategy_notes():
                 ui.label(f"• {note}").classes("note")
-            ui.label("Click a recommendation to draft them").classes("muted q-mt-sm")
+            board_rows = state.ideal_board_rows()
+            if board_rows:
+                ui.label(f"Your board — round {state.current_round}").classes("text-subtitle2 q-mt-sm")
+                ui.label("From Ideal 1st pick.csv — click to draft").classes("muted")
+                shown = 0
+                for row in board_rows:
+                    if not row["available"]:
+                        if row["rank"] <= 2:
+                            ui.label(f"{row['label']}: {row['sheet_name']} — already drafted").classes("muted")
+                        continue
+                    if shown >= 8 and row["rank"] > 2:
+                        continue
+                    shown += 1
+                    cls = "rec-card best" if row["rank"] == 1 else "rec-card"
+                    with ui.element("div").classes(cls).on(
+                        "click", lambda n=row["name"]: draft_named(n)
+                    ):
+                        with ui.column().classes("gap-0"):
+                            ui.label(f"{row['label']}  ·  {row['name']}").classes("font-bold")
+                            ui.label(
+                                f"{row['pos']} · {row['team']} · ADP {row['adp']} · VORP {row['vorp']}"
+                            ).classes("muted")
+                        ui.badge(row["pos"]).style(
+                            f"background:{POS_COLORS.get(row['pos'], '#64748b')}"
+                        )
+            ui.label("Best remaining by role — click to draft").classes("text-subtitle2 q-mt-sm")
+            for row in state.skill_snapshot():
+                best = row["best"]
+                if best is None:
+                    ui.label(f"{row['tier']}: none left").classes("muted")
+                    continue
+                with ui.element("div").classes("rec-card").on("click", lambda n=best.name: draft_named(n)):
+                    with ui.column().classes("gap-0"):
+                        ui.label(f"{row['tier']}  ·  {row['left']} left").classes("muted")
+                        ui.label(best.name).classes("font-bold")
+                        ui.label(f"{best.team} · ADP {best.adp:.1f}").classes("muted")
+                    ui.badge(row["tier"]).style(
+                        f"background:{'#22c55e' if row['tier'].startswith('RB') else '#3b82f6'}"
+                    )
+            ui.label("Balanced ranking").classes("text-subtitle2 q-mt-md")
+            ui.label("Click a recommendation to draft them").classes("muted")
             for row in state.recommendation_rows():
                 cls = "rec-card best" if row["is_rec"] else "rec-card"
                 with ui.element("div").classes(cls).on("click", lambda n=row["name"]: draft_named(n)):
                     with ui.column().classes("gap-0"):
                         tag = "BEST PICK  " if row["is_rec"] else ""
-                        ui.label(f"{tag}{row['name']}").classes("font-bold")
-                        ui.label(f"{row['pos']} · {row['team']} · ADP {row['adp']} · score {row['score']}").classes("muted")
+                        board = "  · board" if row.get("on_board") else ""
+                        ui.label(f"{tag}{row['name']}{board}").classes("font-bold")
+                        ui.label(
+                            f"{row['pos']} · {row['team']} · ADP {row['adp']} · VORP {row['vorp']} · score {row['score']}"
+                        ).classes("muted")
                     ui.badge(row["pos"]).style(f"background:{POS_COLORS.get(row['pos'], '#64748b')}")
             risk = state.at_risk_names()
             if risk:
@@ -326,6 +412,7 @@ def room_page() -> None:
     ui.dark_mode().enable()
     ui.add_css(CSS)
     clock_panel()
+    scarcity_panel()
     board_panel()
     with ui.grid(columns="1.35fr 0.85fr").classes("w-full q-mt-md gap-3"):
         pool_panel()
